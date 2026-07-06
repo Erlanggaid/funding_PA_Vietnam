@@ -1,0 +1,587 @@
+---
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: columns
+    vertical_layout: fill
+    theme:
+      version: 4
+      bootswatch: flatly
+---
+
+<style>
+.navbar { display: none; }
+body { padding-top: 0 !important; }
+</style>
+
+```{r}
+# Install/load necessary packages
+if (!require("dplyr")) install.packages("dplyr")
+if (!require("stringr")) install.packages("stringr")
+if (!require("viridis")) install.packages("viridis")
+if (!require("leaflet")) install.packages("leaflet")
+if (!require("leaflet.extras")) install.packages("leaflet.extras")
+if (!require("leafem")) install.packages("leafem") # for minimap
+if (!require("htmltools")) install.packages("htmltools")
+if (!require("htmlwidgets")) install.packages("htmlwidgets")
+if (!require("maps")) install.packages("maps")
+
+library(dplyr)
+library(stringr)
+library(viridis)
+library(leaflet)
+library(leaflet.extras)
+library(leafem)
+library(htmltools)
+library(htmlwidgets)
+library(sf)
+library(maps)
+
+# 1. Load Vietnam eco data — UPDATED to read Funded_PA_Highlighted.csv
+sites <- read.csv("Funded_PA_Final_Vietnam.csv", check.names = FALSE, stringsAsFactors = FALSE, fileEncoding = "UTF-8")
+sites <- sites[, !is.na(names(sites)) & names(sites) != ""]
+
+# Load WDPA Shapefiles
+shp0 <- st_read("WDPA_WDOECM_Jun2026_Public_VNM_shp_0/WDPA_WDOECM_Jun2026_Public_VNM_shp-polygons.shp", quiet = TRUE, options = "ENCODING=UTF-8")
+shp1 <- st_read("WDPA_WDOECM_Jun2026_Public_VNM_shp_1/WDPA_WDOECM_Jun2026_Public_VNM_shp-polygons.shp", quiet = TRUE, options = "ENCODING=UTF-8")
+shp2 <- st_read("WDPA_WDOECM_Jun2026_Public_VNM_shp_2/WDPA_WDOECM_Jun2026_Public_VNM_shp-polygons.shp", quiet = TRUE, options = "ENCODING=UTF-8")
+
+# Combine and transform to WGS84 for Leaflet
+wdpa_polygons <- rbind(shp0, shp1, shp2)
+wdpa_polygons <- st_transform(wdpa_polygons, 4326)
+
+wdpa_polygons <- st_make_valid(wdpa_polygons)
+
+# Prepare safe popup for WDPA polygons
+wdpa_popup <- paste0(
+  "<div style='font-size: 11px; line-height: 1.4;'>",
+  "<b style='font-size: 13px;'>", if("NAME" %in% names(wdpa_polygons)) wdpa_polygons$NAME else "WDPA Area", "</b><br/>",
+  "<b>Designation:</b> ", if("DESIG_ENG" %in% names(wdpa_polygons)) wdpa_polygons$DESIG_ENG else "Unknown", "<br/>",
+  "<b>Status:</b> ", if("STATUS" %in% names(wdpa_polygons)) wdpa_polygons$STATUS else "Unknown",
+  "</div>"
+)
+
+# 2. Filter out rows with missing coordinates — UPDATED column names
+sites <- sites %>%
+  filter(!is.na(Longitude) & !is.na(Latitude))
+
+# 3. Clean and prepare data for mapping
+# Trim whitespace and standardize case from key fields
+sites$Name <- str_trim(sites$Name)
+sites$`Status Area` <- str_to_title(str_trim(sites$`Status Area`))
+sites$`Status Area` <- gsub("\\bOf\\b", "of", sites$`Status Area`)
+
+# Count duplicates — uniform size, label shows exact count
+sites <- sites %>%
+  group_by(Longitude, Latitude) %>%
+  mutate(loc_count = n()) %>%
+  ungroup() %>%
+  mutate(point_radius = 8)  # fixed uniform radius for all markers
+
+# Helper function to generate multiple links
+generate_multiple_links <- function(info_str) {
+  if (is.na(info_str) || info_str == "") return("No website available")
+  
+  # Split by semicolon or newline, remove empty and trim whitespace
+  links <- unlist(strsplit(info_str, "[;\n]+"))
+  links <- stringr::str_trim(links)
+  links <- links[links != ""]
+  
+  if (length(links) == 0) return("No website available")
+  
+  # Generate a-tags for each valid link
+  a_tags <- paste0('<a href="', links, '" target="_blank">Link ', seq_along(links), '</a>')
+  return(paste(a_tags, collapse = " | "))
+}
+
+# 4. Create clickable links for the website — UPDATED: removed place_url dependency
+sites <- sites %>%
+  mutate(
+    TautanLink = sapply(`More Info`, generate_multiple_links)
+  )
+
+# 5. Create color palette for categorical data
+# Color based on Status Area
+all_status <- unique(sites$`Status Area`)
+all_status <- sort(all_status[!is.na(all_status) & all_status != ""])
+
+# Define custom color palette and explicitly assign mapping
+custom_colors <- c(
+  "Cultural And Historical Site" = "#332288",
+  "National Park" = "#88CCEE",
+  "National Park; Unesco-Mab Biosphere Reserve" = "#44AA99",
+  "National Park; Wetland of International Importance (Ramsar Site)" = "#117733",
+  "Nature Reserve" = "#999933",
+  "Nature Reserve; Wetland of International Importance (Ramsar Site)" = "#DDCC77",
+  "Unesco-Mab Biosphere Reserve" = "#CC6677",
+  "Wetland of International Importance (Ramsar Site)" = "#882255",
+  "Wetland Protected Area" = "#AA4499"
+)
+assigned_colors <- unname(custom_colors[all_status])
+
+pal <- colorFactor(palette = assigned_colors, domain = all_status, na.color = "#808080")
+
+# 6. Create HTML popup labels with formatted table — UPDATED column refs & ES badges
+sites <- sites %>%
+  mutate(
+    popup = paste0(
+      "<div style='font-size: 11px; line-height: 1.5; font-family: Arial, sans-serif;'>",
+      "<div style='background: linear-gradient(135deg, #1a5276, #2980b9); color: #fff; padding: 8px 12px; border-radius: 6px 6px 0 0; margin: -14px -14px 10px -14px;'>",
+      "<b style='font-size: 14px;'>", Name, "</b><br/>",
+      "<span style='font-size: 11px; opacity: 0.9;'>", `Status Area`, "</span>",
+      "</div>",
+      "<table style='width:100%; border-collapse: collapse; margin-bottom: 10px;'>",
+      "<tr style='background:#f8f9fa;'><th style='padding:6px 8px; text-align:left; border-bottom:1px solid #dee2e6; color:#495057; width:35%;'>Type of Financing</th><td style='padding:6px 8px; border-bottom:1px solid #dee2e6;'>", `Type of Financing`, "</td></tr>",
+      "<tr><th style='padding:6px 8px; text-align:left; border-bottom:1px solid #dee2e6; color:#495057;'>Fund Provider</th><td style='padding:6px 8px; border-bottom:1px solid #dee2e6;'>", `Fund Provider`, "</td></tr>",
+      "<tr style='background:#f8f9fa;'><th style='padding:6px 8px; text-align:left; border-bottom:1px solid #dee2e6; color:#495057;'>Intermediaries [Roles]</th><td style='padding:6px 8px; border-bottom:1px solid #dee2e6;'>", `Intermediaries [Roles]`, "</td></tr>",
+      "<tr><th style='padding:6px 8px; text-align:left; border-bottom:1px solid #dee2e6; color:#495057;'>Beneficiaries</th><td style='padding:6px 8px; border-bottom:1px solid #dee2e6;'>", Beneficiaries, "</td></tr>",
+      "<tr style='background:#f8f9fa;'><th style='padding:6px 8px; text-align:left; border-bottom:1px solid #dee2e6; color:#495057;'>Location</th><td style='padding:6px 8px; border-bottom:1px solid #dee2e6;'>", `Location (focussed area)`, "</td></tr>",
+      "<tr><th style='padding:6px 8px; text-align:left; border-bottom:1px solid #dee2e6; color:#495057;'>Duration</th><td style='padding:6px 8px; border-bottom:1px solid #dee2e6;'>", `Duration (year)`, "</td></tr>",
+      "<tr style='background:#f8f9fa;'><th style='padding:6px 8px; text-align:left; border-bottom:1px solid #dee2e6; color:#495057;'>Commodity</th><td style='padding:6px 8px; border-bottom:1px solid #dee2e6;'>", `Commodity [solution-oriented]`, "</td></tr>",
+      "<tr><th style='padding:6px 8px; text-align:left; border-bottom:1px solid #dee2e6; color:#495057;'>Ecosystem Services</th><td style='padding:6px 8px; border-bottom:1px solid #dee2e6;'>", `Ecosystem Services`, "</td></tr>",
+      "</table>",
+      "<div style='padding: 4px 0; border-top: 1px solid #eee;'>",
+      "<b style='color:#555;'>&#128279; References:</b><br/>", TautanLink,
+      "</div>",
+      "</div>"
+    )
+  )
+
+# Function to create an interactive HTML carousel/slider for duplicated popups
+make_slides <- function(popups, lon, lat) {
+  n <- length(popups)
+  if (n == 1) return(popups[1])
+  
+  uid <- paste0(abs(round(lon[1]*10000)), "_", abs(round(lat[1]*10000)), "_", sample(1000:9999, 1))
+  
+  slides <- character(n)
+  for (i in 1:n) {
+    display_style <- if(i == 1) "display:block;" else "display:none;"
+    
+    btn_prev <- if(i > 1) paste0("<button style='margin-right:5px; padding: 4px 12px; font-size: 12px; cursor:pointer; background:#2980b9; color:#fff; border:none; border-radius:4px;' onclick=\"document.getElementById('slide_", uid, "_", i, "').style.display='none'; document.getElementById('slide_", uid, "_", i-1, "').style.display='block';\">&laquo; Prev</button>") else ""
+    btn_next <- if(i < n) paste0("<button style='padding: 4px 12px; font-size: 12px; cursor:pointer; background:#2980b9; color:#fff; border:none; border-radius:4px;' onclick=\"document.getElementById('slide_", uid, "_", i, "').style.display='none'; document.getElementById('slide_", uid, "_", i+1, "').style.display='block';\">Next &raquo;</button>") else ""
+    
+    nav_html <- paste0("<div style='text-align:center; margin-top:15px; padding-top:10px; border-top:2px solid #2980b9;'>", 
+                       "<span style='font-size:12px; color:#2980b9;'><b>Funding Record ", i, " of ", n, "</b></span><br/><div style='margin-top:5px;'>",
+                       btn_prev, btn_next, 
+                       "</div></div>")
+                       
+    slides[i] <- paste0("<div id='slide_", uid, "_", i, "' style='", display_style, "'>", popups[i], nav_html, "</div>")
+  }
+  
+  return(paste0("<div id='carousel_", uid, "'>", paste(slides, collapse=""), "</div>"))
+}
+
+# Combine popups for duplicate locations so they can be viewed via slides
+sites_leaflet <- sites %>%
+  group_by(Longitude, Latitude, `Status Area`, point_radius) %>%
+  summarize(
+    popup    = make_slides(popup, Longitude, Latitude),
+    loc_count = first(loc_count),
+    .groups = "drop"
+  )
+
+# 7. Create Leaflet interactive map
+m <- leaflet(sites_leaflet) %>%
+  
+  # --- ADD BASEMAPS ---
+  addProviderTiles(providers$OpenStreetMap, group = "OpenStreetMap") %>%
+  addProviderTiles(providers$Esri.WorldImagery, group = "Satellite") %>%
+  addProviderTiles(providers$Esri.WorldTopoMap, group = "Terrain") %>%
+  
+  # --- ADD WDPA POLYGONS ---
+  addPolygons(
+    data = wdpa_polygons,
+    fillColor = "forestgreen",
+    fillOpacity = 0.2,
+    color = "darkgreen",
+    weight = 1.5,
+    group = "WDPA Polygons",
+    popup = wdpa_popup,
+    popupOptions = popupOptions(maxWidth = 400, closeOnClick = TRUE)
+  ) %>%
+  
+  addCircleMarkers(
+    lng = ~Longitude, lat = ~Latitude,
+    radius = ~point_radius,   # uniform radius = 14 px for all
+    color = "black",
+    weight = 1.5,
+    fillColor = ~pal(`Status Area`),
+    fillOpacity = 0.85,
+    group = "Funded",
+    popup = ~lapply(popup, HTML),
+    popupOptions = popupOptions(maxWidth = 700, minWidth = 500, closeOnClick = TRUE, autoClose = TRUE)
+  ) %>%
+
+  # Overlay exact funding-count labels centred inside each circle
+  addLabelOnlyMarkers(
+    data = sites_leaflet,
+    lng = ~Longitude, lat = ~Latitude,
+    label = ~as.character(loc_count),
+    group = "Funded",
+    labelOptions = labelOptions(
+      permanent   = TRUE,
+      direction   = "center",
+      textOnly    = TRUE,
+      style = list(
+        "color"       = "white",
+        "font-weight" = "bold",
+        "font-size"   = "11px",
+        "text-shadow" = "0 0 3px rgba(0,0,0,0.7)"
+      )
+    )
+  ) %>%
+
+  addLegend(
+    pal = pal,
+    values = all_status,
+    title = "Status Area",
+    position = "bottomright",
+    opacity = 0.8,
+    na.label = "Unknown"
+  ) %>%
+  addControl(
+    html = "<div style='background: white; padding: 10px; border-radius: 6px; box-shadow: 0 2px 8px rgba(0,0,0,0.3); line-height: 20px; margin-bottom: 5px;'>
+      <strong style='font-size: 13px; margin-bottom: 8px; display: block; color: #333;'>Number of Fundings</strong>
+      <div style='display: flex; align-items: center; gap: 8px; margin-bottom: 4px;'>
+        <div style='width: 28px; height: 28px; border-radius: 50%; background: #555; border: 1.5px solid #333; display: flex; align-items: center; justify-content: center; flex-shrink: 0;'>
+          <span style='color: white; font-size: 11px; font-weight: bold;'>n</span>
+        </div>
+        <span style='font-size: 12px; color: #333;'>= number of funding in the PA </span>
+      </div>
+    </div>",
+    position = "bottomright"
+  ) %>%
+  addMiniMap(
+    tiles = providers$OpenStreetMap,
+    toggleDisplay = TRUE,
+    position = "bottomleft"
+  ) %>%
+  addMouseCoordinates() %>%
+  
+  # --- ADD LAYER CONTROL CHECKLIST ---
+  addLayersControl(
+    baseGroups = c("OpenStreetMap", "Satellite", "Terrain"),
+    overlayGroups = c("WDPA Polygons", "Funded"),
+    options = layersControlOptions(collapsed = FALSE)
+  )
+
+# 8. Print map in R viewer or R Markdown
+m
+
+# 9. Save as an interactive standalone HTML file
+saveWidget(m, file = "funded_PA_map.html", selfcontained = TRUE, libdir = "funded_PA_lib")
+```
+
+```{r}
+# ── 1. Install / load packages ────────────────────────────────────────────────
+if (!require("sf"))           install.packages("sf")
+if (!require("readr"))        install.packages("readr")
+if (!require("dplyr"))        install.packages("dplyr")
+if (!require("maps"))         install.packages("maps")
+if (!require("stringr"))      install.packages("stringr")
+if (!require("viridis"))      install.packages("viridis")
+
+library(sf)
+library(readr)
+library(dplyr)
+library(maps)
+library(stringr)
+library(viridis)
+
+# =============================================================================
+# 2. Read updated data — UPDATED to Funded_PA_Highlighted.csv with new columns
+# =============================================================================
+funded_only <- read.csv("Funded_PA_Final_Vietnam.csv", 
+                        stringsAsFactors = FALSE, 
+                        check.names = FALSE,
+                        fileEncoding = "UTF-8")
+funded_only <- funded_only[, !is.na(names(funded_only)) & names(funded_only) != ""]
+
+# Clean and trim strings — UPDATED column names
+funded_only$Name <- str_trim(funded_only$Name)
+funded_only$`Status Area` <- str_to_title(str_trim(funded_only$`Status Area`))
+funded_only$`Status Area` <- gsub("\\bOf\\b", "of", funded_only$`Status Area`)
+
+# Remove rows with missing coordinates or empty status area — UPDATED column names
+funded_clean <- funded_only %>%
+  filter(!is.na(Longitude) & !is.na(Latitude) & !is.na(`Status Area`) & `Status Area` != "")
+
+# Extract levels from dataset
+all_status_static <- unique(funded_clean$`Status Area`)
+all_status_static <- sort(all_status_static[!is.na(all_status_static) & all_status_static != ""])
+
+# Convert Status Area to factor for categorical color mapping
+funded_clean$`Status Area` <- factor(funded_clean$`Status Area`, levels = all_status_static)
+
+# Count duplicates — uniform size, label shows exact count
+funded_clean <- funded_clean %>%
+  group_by(Longitude, Latitude) %>%
+  mutate(loc_count = n()) %>%
+  ungroup() %>%
+  mutate(point_cex = 1.2)  # fixed uniform size for all markers
+
+# Deduplicated coordinates for label placement (one label per unique location)
+funded_unique <- funded_clean %>%
+  group_by(Longitude, Latitude) %>%
+  slice(1) %>%
+  ungroup()
+
+# Exact coordinates — UPDATED column names
+coords_funded <- data.frame(lon = funded_clean$Longitude, lat = funded_clean$Latitude)
+
+# =============================================================================
+# 3. Colour scale -- mapping based on Status Area
+# =============================================================================
+# Extract unique levels and generate colors dynamically
+status_levels <- levels(funded_clean$`Status Area`)
+custom_colors <- c(
+  "Cultural And Historical Site" = "#332288",
+  "National Park" = "#88CCEE",
+  "National Park; Unesco-Mab Biosphere Reserve" = "#44AA99",
+  "National Park; Wetland of International Importance (Ramsar Site)" = "#117733",
+  "Nature Reserve" = "#999933",
+  "Nature Reserve; Wetland of International Importance (Ramsar Site)" = "#DDCC77",
+  "Unesco-Mab Biosphere Reserve" = "#CC6677",
+  "Wetland of International Importance (Ramsar Site)" = "#882255",
+  "Wetland Protected Area" = "#AA4499"
+)
+status_colors <- unname(custom_colors[status_levels])
+
+# Assign colors to each point
+point_colors_funded <- status_colors[as.numeric(funded_clean$`Status Area`)]
+
+# =============================================================================
+# 4. Map bounds (Adjusted for Vietnam)
+# =============================================================================
+min_lon <- 98; max_lon <- 114
+min_lat <- 7;   max_lat <- 25
+
+# =============================================================================
+# 5. Open PDF device for Funded Status map
+# =============================================================================
+pdf("National_Parks_&_Nature_Reserves_Received_Funding_Supports_in_Vietnam.pdf", width = 8, height = 10)
+
+old_par <- par(no.readonly = TRUE)
+par(xaxs = "i", yaxs = "i")
+
+mean_lat <- mean(c(min_lat, max_lat))
+aspect_ratio <- 1 / cos(mean_lat * pi / 180)
+
+# Initialise blank plot
+plot(NA,
+     xlim = c(min_lon, max_lon),
+     ylim = c(min_lat, max_lat),
+     asp = aspect_ratio,
+     type = "n", xlab = "", ylab = "", axes = FALSE)
+
+# Ocean background
+usr <- par("usr")
+rect(usr[1], usr[3], usr[2], usr[4], col = "lightblue", border = NA)
+
+# Land polygons (World - outside Vietnam)
+maps::map("world",
+    xlim = c(min_lon - 2, max_lon + 2), ylim = c(min_lat - 2, max_lat + 2),
+    col = "white", fill = TRUE, add = TRUE)
+
+# Vietnam polygon
+maps::map("world", region = "Vietnam",
+    xlim = c(min_lon - 2, max_lon + 2), ylim = c(min_lat - 2, max_lat + 2),
+    col = "grey85", fill = TRUE, add = TRUE)
+
+# Plot WDPA shapefile polygons
+plot(st_geometry(wdpa_polygons), col = adjustcolor("forestgreen", alpha.f = 0.2), border = "darkgreen", lwd = 0.5, add = TRUE)
+
+# Grid lines every 2 degrees
+abline(v = seq(min_lon, max_lon, 2), col = "grey70", lty = 3)
+abline(h = seq(min_lat, max_lat, 2), col = "grey70", lty = 3)
+
+# Axes
+axis(1, at = seq(min_lon, max_lon, 2), labels = paste0(seq(min_lon, max_lon, 2), "\u00b0E"), cex.axis = 0.7)
+axis(2, at = seq(min_lat, max_lat, 2), labels = paste0(abs(seq(min_lat, max_lat, 2)), ifelse(seq(min_lat, max_lat, 2) < 0, "\u00b0S", "\u00b0N")), cex.axis = 0.7)
+
+# Plot points — uniform size
+points(coords_funded[, 1], coords_funded[, 2],
+       pch = 21, bg = point_colors_funded, col = "black", cex = funded_clean$point_cex)
+
+# Overlay exact funding-count labels centred inside each circle
+text(funded_unique$Longitude, funded_unique$Latitude,
+     labels = funded_unique$loc_count,
+     cex = 0.45, col = "white", font = 2)
+
+# Categorical Legend
+legend("topright", 
+       legend = status_levels,
+       pt.bg = status_colors, 
+       pch = 22, col = "black", pt.cex = 0.9, # square box to indicate just color
+       title = "Status Area",
+       bg = "white", cex = 0.375, inset = c(0.02, 0.05))
+
+# Number of Fundings legend — circle with white "n" centred inside
+leg_fund1 <- legend(
+  "topright",
+  legend    = "= number of fundings in the PA",
+  pt.bg     = "grey50",
+  pch       = 21, col = "black", pt.cex = 1.2,
+  title     = "Number of Fundings",
+  bg        = "white", cex = 0.675,
+  x.intersp = 1.2, y.intersp = 1.0,
+  inset     = c(0.02, 0.265))
+
+# Overlay white "n" centred inside the legend circle symbol
+text(
+  x      = (leg_fund1$rect$left + leg_fund1$text$x[1]) / 2,
+  y      = leg_fund1$text$y[1],
+  labels = "n",
+  col    = "white", cex = 0.42, font = 2
+)
+
+# Scale bar & North arrow
+scalebar_x <- min_lon + 0.5
+scalebar_y <- min_lat + 0.5
+rect(scalebar_x, scalebar_y, scalebar_x + 1.8, scalebar_y + 0.1, col = "black")
+text(scalebar_x + 0.9, scalebar_y - 0.3, "200 km", cex = 0.7, adj = 0.5)
+
+north_x <- min_lon + 0.5
+north_y <- max_lat - 0.5
+text(north_x, north_y, "N", cex = 1.1, font = 2)
+
+# Map title
+title(
+  main = "National Parks & Nature Reserves Received Funding Supports in Vietnam",
+  sub  = paste0("n = ", nrow(funded_clean), " sites"),
+  cex.main = 1.05, font.main = 2, col.main = "grey10",
+  cex.sub  = 0.8, col.sub  = "grey30"
+)
+
+# Add connected border around the map
+box(lwd = 1.5)
+
+par(old_par)
+dev.off()
+
+cat("\n✅ Static map created successfully!\n")
+cat("📁 Map saved as: National_Parks_&_Nature_Reserves_Received_Funding_Supports_in_Vietnam.pdf\n")
+```
+
+```{r}
+# =============================================================================
+if (!require("maptiles")) install.packages("maptiles")
+if (!require("terra")) install.packages("terra")
+
+library(maptiles)
+library(terra)
+library(sf)
+
+# We use the same 'coords_funded', 'funded_clean', 'status_colors', 'point_colors_funded',
+# 'min_lon', 'max_lon', 'min_lat', 'max_lat', 'status_levels' as above.
+
+# Create an expanded bounding box polygon for the Vietnam region to fetch tiles so it covers the entire plot window
+bbox_vietnam <- st_bbox(c(xmin = min_lon - 2, xmax = max_lon + 2, ymin = min_lat - 2, ymax = max_lat + 2), crs = 4326)
+vietnam_sfc <- st_as_sfc(bbox_vietnam)
+
+# Fetch terrain tiles (Esri.WorldTopoMap)
+# Zoom level 6 provides a good balance of detail and download size for the whole country
+# Use project = TRUE to ensure tiles match the EPSG:4326 coordinate system used in the plot
+terrain_tiles <- get_tiles(x = vietnam_sfc, provider = "Esri.WorldTopoMap", zoom = 6, crop = TRUE, project = TRUE)
+
+# Open PDF device
+pdf("National Parks & Nature Reserves Received Funding Supports in Vietnam (Terrain).pdf", width = 8, height = 10)
+
+old_par <- par(no.readonly = TRUE)
+par(xaxs = "i", yaxs = "i")
+
+mean_lat <- mean(c(min_lat, max_lat))
+aspect_ratio <- 1 / cos(mean_lat * pi / 180)
+
+# Initialise blank plot
+plot(NA,
+     xlim = c(min_lon, max_lon),
+     ylim = c(min_lat, max_lat),
+     asp = aspect_ratio,
+     type = "n", xlab = "", ylab = "", axes = FALSE)
+
+# Plot the downloaded terrain tiles as the background
+plot_tiles(terrain_tiles, add = TRUE)
+
+# Draw Vietnam border in blue
+maps::map("world", region = "Vietnam",
+    xlim = c(min_lon - 2, max_lon + 2), ylim = c(min_lat - 2, max_lat + 2),
+    col = "blue", fill = FALSE, add = TRUE, lwd = 2)
+
+# Plot WDPA shapefile polygons
+plot(st_geometry(wdpa_polygons), col = adjustcolor("forestgreen", alpha.f = 0.2), border = "darkgreen", lwd = 0.5, add = TRUE)
+
+# Grid lines every 2 degrees
+abline(v = seq(min_lon, max_lon, 2), col = "grey30", lty = 3)
+abline(h = seq(min_lat, max_lat, 2), col = "grey30", lty = 3)
+
+# Axes
+axis(1, at = seq(min_lon, max_lon, 2), labels = paste0(seq(min_lon, max_lon, 2), "\u00b0E"), cex.axis = 0.7)
+axis(2, at = seq(min_lat, max_lat, 2), labels = paste0(abs(seq(min_lat, max_lat, 2)), ifelse(seq(min_lat, max_lat, 2) < 0, "\u00b0S", "\u00b0N")), cex.axis = 0.7)
+
+# Plot points — uniform size
+points(coords_funded[, 1], coords_funded[, 2],
+       pch = 21, bg = point_colors_funded, col = "black", cex = funded_clean$point_cex)
+
+# Overlay exact funding-count labels centred inside each circle
+text(funded_unique$Longitude, funded_unique$Latitude,
+     labels = funded_unique$loc_count,
+     cex = 0.45, col = "white", font = 2)
+
+# Categorical Legend
+legend("topright", 
+       legend = status_levels,
+       pt.bg = status_colors, 
+       pch = 22, col = "black", pt.cex = 0.9, # square box to indicate just color
+       title = "Status Area",
+       bg = "white", cex = 0.375, inset = c(0.02, 0.05))
+
+# Number of Fundings legend — circle with white "n" centred inside
+leg_fund2 <- legend(
+  "topright",
+  legend    = "= number of fundings in the PA",
+  pt.bg     = "grey50",
+  pch       = 21, col = "black", pt.cex = 1.2,
+  title     = "Number of Fundings",
+  bg        = "white", cex = 0.675,
+  x.intersp = 1.2, y.intersp = 1.0,
+  inset     = c(0.02, 0.265))
+
+# Overlay white "n" centred inside the legend circle symbol
+text(
+  x      = (leg_fund2$rect$left + leg_fund2$text$x[1]) / 2,
+  y      = leg_fund2$text$y[1],
+  labels = "n",
+  col    = "white", cex = 0.42, font = 2
+)
+
+# Scale bar & North arrow
+scalebar_x <- min_lon + 0.5
+scalebar_y <- min_lat + 0.5
+
+# White background box for scalebar so it's readable over terrain
+rect(scalebar_x, scalebar_y, scalebar_x + 1.8, scalebar_y + 0.15, col = "white", border = "black")
+rect(scalebar_x, scalebar_y, scalebar_x + 0.9, scalebar_y + 0.15, col = "black")
+text(scalebar_x + 0.9, scalebar_y - 0.3, "200 km", cex = 0.7, adj = 0.5, font = 2)
+
+north_x <- min_lon + 0.5
+north_y <- max_lat - 0.5
+text(north_x, north_y, "N", cex = 1.1, font = 2)
+
+# Map title
+title(
+  main = "National Parks & Nature Reserves Received Funding Supports in Vietnam (Terrain)",
+  sub  = paste0("n = ", nrow(funded_clean), " sites"),
+  cex.main = 1.05, font.main = 2, col.main = "grey10",
+  cex.sub  = 0.8, col.sub  = "grey30"
+)
+
+# Add connected border around the map
+box(lwd = 1.5)
+
+par(old_par)
+dev.off()
+
+cat("\n✅ Terrain static map created successfully!\n")
+cat("📁 Map saved as: National_Parks_&_Nature_Reserves_Received_Funding_Supports_in_Vietnam_Terrain.pdf\n")
+```
